@@ -139,14 +139,10 @@ const handler = createMcpHandler(
       {
         notebook_id: z.string().min(1).describe("The notebook ID"),
         url: z.string().url().describe("The website URL to add as a source"),
-        wait_for_processing: z
-          .boolean()
-          .default(true)
-          .describe("Wait for the source to finish processing before returning (recommended)"),
       },
-      async ({ notebook_id, url, wait_for_processing }) => {
+      async ({ notebook_id, url }) => {
         try {
-          const result = await addSourceUrl(notebook_id, url, wait_for_processing);
+          const result = await addSourceUrl(notebook_id, url);
           return ok(result);
         } catch (e) {
           return err(e);
