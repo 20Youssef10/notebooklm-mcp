@@ -95,15 +95,16 @@ async function call(auth: AuthTokens, methodId: string, params: unknown[], noteb
 }
 
 function parseResp(text: string): unknown {
-  const clean = text.replace(/^\)]\}'\n/, "");
+  // batchexecute format: [["wrb.fr", METHOD_ID, DATA_JSON_STRING, ...], ...]
+  // DATA is at row[2], not row[1]
+  const clean = text.replace(/^\)\]\}'\n/, "").trim();
   try {
     const outer = JSON.parse(clean) as unknown[][];
     for (const row of outer) {
-      if (Array.isArray(row) && typeof row[1] === "string" && row[1].startsWith("[")) {
-        try { return JSON.parse(row[1]); } catch { /* skip */ }
-      }
-      if (Array.isArray(row) && typeof row[1] === "string") {
-        return row[1];
+      if (!Array.isArray(row)) continue;
+      // Standard batchexecute: ["wrb.fr", methodId, dataJsonString, ...]
+      if (row[0] === "wrb.fr" && typeof row[2] === "string") {
+        try { return JSON.parse(row[2]); } catch { return row[2]; }
       }
     }
     return outer;
@@ -122,39 +123,42 @@ export interface Artifact { id: string; type: string; status: string; title: str
 
 // ─── Notebooks ────────────────────────────────────────────────────────────────
 export async function listNotebooks(auth: AuthTokens): Promise<Notebook[]> {
-  const data = await call(auth, M.LIST_NOTEBOOKS, [null]) as unknown[][];
+  const data = await call(auth, M.LIST_NOTEBOOKS, [null]);
+  console.log("[listNotebooks] raw:", JSON.stringify(data).slice(0, 400));
   if (!Array.isArray(data)) return [];
-  const rows = Array.isArray(data[0]) ? data[0] as unknown[][] : data as unknown[][];
-  return rows.filter(Array.isArray).map((r) => ({
-    id:          String(r[2] ?? r[0] ?? ""),
-    title:       String(r[1] ?? "Untitled"),
-    url:         `${BASE}/notebook/${String(r[2] ?? r[0] ?? "")}`,
-    sourceCount: typeof r[6] === "number" ? r[6] : 0,
-  })).filter((n) => n.id);
+
+  // data[0] contains the array of notebook entries
+  // Each entry: [title, null, id, null, null, [...metadata...]]
+  const entries = Array.isArray(data[0]) ? data[0] as unknown[][] : data as unknown[][];
+
+  return entries.filter(Array.isArray).map((r) => {
+    // Try data[2] first (ID position from CREATE_NOTEBOOK response pattern)
+    const id = typeof r[2] === "string" ? r[2] : String(r[0] ?? "");
+    const title = typeof r[0] === "string" ? r[0] : String(r[1] ?? "Untitled");
+    const sourceCount = typeof r[6] === "number" ? r[6] : 0;
+    return { id, title, url: `${BASE}/notebook/${id}`, sourceCount };
+  }).filter((n) => n.id && n.id.length > 5);
 }
 
 export async function createNotebook(auth: AuthTokens, title: string): Promise<Notebook> {
-  const data = await call(auth, M.CREATE_NOTEBOOK, [title, null, null, [2], [1]]);
+  // Response: ["AI Development Notes", null, "c541cf08-bdc9-...", null, null, [...]]
+  // ID is at index 2 of the parsed inner array
+  const data = await call(auth, M.CREATE_NOTEBOOK, [title, null, null, [2], [1]]) as unknown[];
   const raw = JSON.stringify(data);
-  console.log("[createNotebook] raw:", raw.slice(0, 600));
 
-  // Recursively find a string that looks like a NotebookLM ID
-  const findId = (obj: unknown, depth = 0): string => {
-    if (depth > 5) return "";
-    if (typeof obj === "string") {
-      const s = obj.trim();
-      if (s.length >= 8 && s.length <= 60 && /^[a-zA-Z0-9_-]+$/.test(s) && s !== title) return s;
+  let id = "";
+  if (Array.isArray(data)) {
+    // data[2] is the notebook ID (UUID format)
+    if (typeof data[2] === "string" && data[2].length > 5) {
+      id = data[2];
+    } else {
+      // Fallback: find first UUID-like string
+      for (const v of data) {
+        if (typeof v === "string" && /^[0-9a-f-]{8,}$/i.test(v)) { id = v; break; }
+      }
     }
-    if (Array.isArray(obj)) {
-      for (const v of obj) { const r = findId(v, depth + 1); if (r) return r; }
-    }
-    if (obj && typeof obj === "object") {
-      for (const v of Object.values(obj as Record<string,unknown>)) { const r = findId(v, depth + 1); if (r) return r; }
-    }
-    return "";
-  };
+  }
 
-  const id = findId(data);
   if (!id) throw new Error("createNotebook: no ID in response. Raw: " + raw.slice(0, 400));
   return { id, title, url: `${BASE}/notebook/${id}`, sourceCount: 0 };
 }
