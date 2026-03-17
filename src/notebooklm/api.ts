@@ -138,20 +138,37 @@ export interface Artifact { id: string; type: string; status: string; title: str
 // ─── Notebooks ────────────────────────────────────────────────────────────────
 export async function listNotebooks(auth: AuthTokens): Promise<Notebook[]> {
   const data = await call(auth, M.LIST_NOTEBOOKS, [null]);
-  console.log("[listNotebooks] raw:", JSON.stringify(data).slice(0, 400));
+
+  // Log first 600 chars for debugging
+  console.log("[listNotebooks] raw:", JSON.stringify(data).slice(0, 600));
+
   if (!Array.isArray(data)) return [];
 
-  // data[0] contains the array of notebook entries
-  // Each entry: [title, null, id, null, null, [...metadata...]]
-  const entries = Array.isArray(data[0]) ? data[0] as unknown[][] : data as unknown[][];
+  // LIST_NOTEBOOKS returns an array of notebook entries at data[0]
+  // Each entry (from CREATE_NOTEBOOK shape): [title, null, id, null, null, meta, null, ..., null, sources_array]
+  //   data[0] = title (string)
+  //   data[2] = notebook ID (UUID string)
+  //   data[11] = [[sourceId1], [sourceId2], ...] — length = source count
+  const entries: unknown[][] = [];
+  if (Array.isArray(data[0]) && Array.isArray(data[0][0])) {
+    // data[0] is the list of notebooks
+    entries.push(...(data[0] as unknown[][]));
+  } else if (Array.isArray(data[0])) {
+    // data itself might be the list
+    entries.push(...(data as unknown[][]));
+  }
+
+  console.log("[listNotebooks] entries count:", entries.length);
 
   return entries.filter(Array.isArray).map((r) => {
-    // Try data[2] first (ID position from CREATE_NOTEBOOK response pattern)
-    const id = typeof r[2] === "string" ? r[2] : String(r[0] ?? "");
-    const title = typeof r[0] === "string" ? r[0] : String(r[1] ?? "Untitled");
-    const sourceCount = typeof r[6] === "number" ? r[6] : 0;
+    const id    = typeof r[2] === "string" && r[2].length > 5 ? r[2] : "";
+    const title = typeof r[0] === "string" ? r[0] : "Untitled";
+    // sources are at r[11]: [[id1],[id2],...] or r[6] as number
+    const srcArr = Array.isArray(r[11]) ? r[11] : [];
+    const sourceCount = srcArr.length > 0 ? srcArr.length : (typeof r[6] === "number" ? r[6] : 0);
+    if (!id) return null;
     return { id, title, url: `${BASE}/notebook/${id}`, sourceCount };
-  }).filter((n) => n.id && n.id.length > 5);
+  }).filter(Boolean) as Notebook[];
 }
 
 export async function createNotebook(auth: AuthTokens, title: string): Promise<Notebook> {
@@ -211,14 +228,37 @@ export async function listSources(auth: AuthTokens, notebookId: string): Promise
 
 export async function addSourceUrl(auth: AuthTokens, notebookId: string, url: string): Promise<{ success: boolean; message: string }> {
   const isYT = /youtube\.com|youtu\.be/.test(url);
-  // params: [notebookId, [[source_type, url]]]  type 1=web, 6=youtube
-  await call(auth, M.ADD_SOURCE, [notebookId, [[isYT ? 6 : 1, url]]], notebookId);
-  return { success: true, message: `Added ${isYT ? "YouTube" : "URL"}: ${url}` };
+  const srcType = isYT ? 6 : 1;
+
+  // Try different param structures — the exact nesting matters
+  // Attempt 1: [notebookId, [[type, url]]]
+  // Attempt 2: [notebookId, [type, url]]
+  // Attempt 3: [[notebookId, [[type, url]]]]
+  const variants: unknown[][] = [
+    [notebookId, [[srcType, url]]],
+    [notebookId, [srcType, url]],
+    [notebookId, [[srcType, url, null]]],
+    [notebookId, [[srcType, url, null, null]]],
+  ];
+
+  let lastErr = "";
+  for (const params of variants) {
+    try {
+      const data = await call(auth, M.ADD_SOURCE, params, notebookId);
+      console.log("[addSourceUrl] success with params:", JSON.stringify(params), "raw:", JSON.stringify(data).slice(0, 200));
+      return { success: true, message: `Added ${isYT ? "YouTube" : "URL"}: ${url}` };
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+      console.log("[addSourceUrl] failed params:", JSON.stringify(params), "error:", lastErr.slice(0, 100));
+      if (!lastErr.includes("400")) throw e; // non-400 = real error
+    }
+  }
+  throw new Error(`addSourceUrl failed all variants. Last: ${lastErr}`);
 }
 
 export async function addSourceText(auth: AuthTokens, notebookId: string, content: string, title = "Pasted text"): Promise<{ success: boolean; message: string }> {
-  // type 3 = text
-  await call(auth, M.ADD_SOURCE, [notebookId, [[3, content, title]]], notebookId);
+  const data = await call(auth, M.ADD_SOURCE, [notebookId, [[3, content, title]]], notebookId);
+  console.log("[addSourceText] raw:", JSON.stringify(data).slice(0, 200));
   return { success: true, message: `Text source "${title}" added.` };
 }
 
