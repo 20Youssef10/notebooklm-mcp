@@ -1,8 +1,3 @@
 import type { NextConfig } from "next";
-
-const nextConfig: NextConfig = {
-  // Needed to use playwright-core in Next.js functions
-  serverExternalPackages: ["playwright-core"],
-};
-
+const nextConfig: NextConfig = {};
 export default nextConfig;
