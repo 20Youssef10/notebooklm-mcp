@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+out/
+
+# Environment variables (NEVER commit these)
+.env
+.env.local
+.env.production
+.notebooklm-state.json
+
+# Vercel
+.vercel/
+
+# TypeScript
+*.tsbuildinfo
+
+# Playwright (local only)
+playwright-report/
+test-results/
+
+# Logs
+*.log
+npm-debug.log*
+.vercel/
