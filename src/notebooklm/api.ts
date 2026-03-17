@@ -3,6 +3,7 @@
  * All operations via Google's internal batchexecute RPC endpoint.
  */
 import type { AuthTokens } from "./rpc";
+import { invalidateCache } from "./rpc";
 
 const BASE = "https://notebooklm.google.com";
 const RPC_URL = `${BASE}/_/LabsTailwindUi/data/batchexecute`;
@@ -26,38 +27,68 @@ const M = {
 } as const;
 
 // ─── Core fetch ───────────────────────────────────────────────────────────────
-async function call(
-  auth: AuthTokens,
-  methodId: string,
-  params: unknown[],
-  notebookId?: string
-): Promise<unknown> {
+async function doFetch(auth: AuthTokens, methodId: string, params: unknown[], notebookId?: string) {
   const url = new URL(RPC_URL);
   url.searchParams.set("rpcids", methodId);
   url.searchParams.set("source-path", notebookId ? `/notebook/${notebookId}` : "/");
   url.searchParams.set("bl", "boq_labs-tailwind-ui_20250101.00_p0");
   url.searchParams.set("hl", "en");
   url.searchParams.set("rt", "c");
+  if (auth.sessionId) url.searchParams.set("f.sid", auth.sessionId);
 
-  const freqInner = JSON.stringify(params);
-  const freq = JSON.stringify([[[methodId, freqInner, null, "generic"]]]);
-  const body = `f.req=${encodeURIComponent(freq)}`;
+  const freq = JSON.stringify([[[methodId, JSON.stringify(params), null, "generic"]]]);
+  const body = `f.req=${encodeURIComponent(freq)}&at=${encodeURIComponent(auth.csrfToken)}&`;
 
-  const res = await fetch(url.toString(), {
+  return fetch(url.toString(), {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
       Cookie: auth.cookieHeader,
       Authorization: auth.sapisidHash,
-      Referer: BASE,
+      Referer: `${BASE}/`,
       Origin: BASE,
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
       "X-Goog-AuthUser": "0",
     },
     body,
   });
+}
 
-  if (!res.ok) throw new Error(`RPC ${methodId} → HTTP ${res.status}: ${await res.text().then(t => t.slice(0, 200))}`);
+/**
+ * Execute a batchexecute RPC call.
+ * If we get HTTP 400 (stale XSRF), invalidate the cache and retry once
+ * using the fresh XSRF token that Google embeds in the error body.
+ */
+async function call(
+  auth: AuthTokens,
+  methodId: string,
+  params: unknown[],
+  notebookId?: string
+): Promise<unknown> {
+  let res = await doFetch(auth, methodId, params, notebookId);
+
+  if (res.status === 400) {
+    const errBody = await res.text();
+
+    // Extract the fresh XSRF token Google put in the error body
+    const xsrfMatch = errBody.match(/"xsrf"\s*,\s*"([^"]+)"/);
+    if (xsrfMatch) {
+      // Patch auth with the correct token and retry
+      const freshAuth: AuthTokens = { ...auth, csrfToken: xsrfMatch[1] };
+      invalidateCache(); // clear global cache so next call re-probes
+      res = await doFetch(freshAuth, methodId, params, notebookId);
+      if (!res.ok) {
+        throw new Error(`RPC ${methodId} → HTTP ${res.status} (after xsrf retry): ${(await res.text()).slice(0, 300)}`);
+      }
+      return parseResponse(await res.text());
+    }
+
+    throw new Error(`RPC ${methodId} → HTTP 400: ${errBody.slice(0, 300)}`);
+  }
+
+  if (!res.ok) {
+    throw new Error(`RPC ${methodId} → HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  }
 
   return parseResponse(await res.text());
 }

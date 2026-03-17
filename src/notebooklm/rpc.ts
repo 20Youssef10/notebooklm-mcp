@@ -1,89 +1,62 @@
 /**
  * NotebookLM Auth
- * 1. Fetches notebooklm.google.com with stored cookies (plain HTTP, no browser)
- * 2. Extracts the XSRF token embedded in the page HTML
- * 3. Builds SAPISIDHASH for the Authorization header
+ *
+ * Key insight: Google batchexecute returns the required XSRF token in the
+ * HTTP 400 error body when `at=` is wrong or missing.
+ * We exploit this: send a probe request, extract the token from the error,
+ * then cache it for all subsequent calls.
+ *
+ * Pattern: probe → parse xsrf from 400 → retry with real token ✅
  */
 import { createHash } from "crypto";
 
 export interface AuthTokens {
   cookieHeader: string;
-  csrfToken:    string;   // XSRF token from page HTML (used as at= param)
-  sapisidHash:  string;   // Authorization header value
+  csrfToken:    string;  // XSRF token (at= param)
+  sapisidHash:  string;  // Authorization header
   sessionId:    string;
 }
 
-// Cache per cold-start (invalidated if token fetch fails)
 let cache: AuthTokens | null = null;
 
-function buildSAPISIDHASH(sapisid: string, origin: string): string {
+// ─── SAPISIDHASH (Authorization header) ──────────────────────────────────────
+function buildSAPISIDHASH(sapisid: string): string {
   const now = Math.floor(Date.now() / 1000);
   const hash = createHash("sha1")
-    .update(`${now} ${sapisid} ${origin}`)
+    .update(`${now} ${sapisid} https://notebooklm.google.com`)
     .digest("hex");
   return `SAPISIDHASH ${now}_${hash}`;
 }
 
-async function fetchXsrfToken(cookieHeader: string): Promise<{ xsrf: string; sid: string }> {
-  const origin = "https://notebooklm.google.com";
+// ─── Extract XSRF from a 400 error body ──────────────────────────────────────
+function extractXsrfFromError(body: string): string | null {
+  // Error body contains: ["xsrf","TOKEN_VALUE",...]
+  const m = body.match(/"xsrf"\s*,\s*"([^"]+)"/);
+  return m ? m[1] : null;
+}
 
-  const res = await fetch(origin, {
-    method: "GET",
-    headers: {
-      Cookie: cookieHeader,
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-    redirect: "follow",
-  });
-
-  const html = await res.text();
-
-  // Google embeds the XSRF token in various ways — try all patterns
+// ─── Extract XSRF from page HTML ─────────────────────────────────────────────
+function extractXsrfFromHtml(html: string): string | null {
   const patterns = [
     /"SNlM0e":"([^"]+)"/,
     /SNlM0e":"([^"]+)"/,
-    /"xsrf","([^"]+)"/,
-    /"at":"([^"]+)"/,
-    /\["xsrf","([^"]+)"/,
     /'SNlM0e':"([^"]+)"/,
   ];
-
-  let xsrf = "";
-  for (const pat of patterns) {
-    const m = html.match(pat);
-    if (m) { xsrf = m[1]; break; }
+  for (const p of patterns) {
+    const m = html.match(p);
+    if (m) return m[1];
   }
-
-  // Also try extracting from WIZ_global_data blob
-  if (!xsrf) {
-    const wizMatch = html.match(/WIZ_global_data\s*=\s*(\{.{0,2000}?\})\s*;/s);
-    if (wizMatch) {
-      const snlMatch = wizMatch[1].match(/"SNlM0e"\s*:\s*"([^"]+)"/);
-      if (snlMatch) xsrf = snlMatch[1];
-    }
-  }
-
-  // Extract f.sid (session ID used in batchexecute URL)
-  const sidMatch = html.match(/"FdrFJe"\s*:\s*"([^"]+)"/) ||
-                   html.match(/\["FdrFJe","([^"]+)"\]/);
-  const sid = sidMatch ? sidMatch[1] : "";
-
-  if (!xsrf) {
-    // Log a snippet for debugging
-    const snippet = html.slice(0, 3000);
-    throw new Error(
-      `Could not extract XSRF token from NotebookLM page.\n` +
-      `HTTP status: ${res.status}\n` +
-      `Page snippet (first 500 chars): ${snippet.slice(0, 500)}\n` +
-      `This usually means the Google session has expired. Please refresh NOTEBOOKLM_STORAGE_STATE.`
-    );
-  }
-
-  return { xsrf, sid };
+  return null;
 }
 
+// ─── Extract f.sid from HTML ──────────────────────────────────────────────────
+function extractSidFromHtml(html: string): string {
+  const m = html.match(/"FdrFJe"\s*:\s*"([^"]+)"/) ||
+            html.match(/\["FdrFJe","([^"]+)"\]/);
+  return m ? m[1] : "";
+}
+
+// ─── Main: build auth tokens ──────────────────────────────────────────────────
 export async function buildAuthTokens(forceRefresh = false): Promise<AuthTokens> {
   if (cache && !forceRefresh) return cache;
 
@@ -100,16 +73,69 @@ export async function buildAuthTokens(forceRefresh = false): Promise<AuthTokens>
     state.cookies.find((c) => c.name === "__Secure-3PAPISID")?.value ||
     state.cookies.find((c) => c.name === "SAPISID")?.value || "";
 
-  if (!sapisid) throw new Error("SAPISID cookie not found. Please refresh your session.");
+  if (!sapisid) throw new Error("SAPISID cookie not found — session may have expired.");
 
-  const origin = "https://notebooklm.google.com";
-  const sapisidHash = buildSAPISIDHASH(sapisid, origin);
+  const sapisidHash = buildSAPISIDHASH(sapisid);
+  const commonHeaders = {
+    Cookie: cookieHeader,
+    Authorization: sapisidHash,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "X-Goog-AuthUser": "0",
+    Origin: "https://notebooklm.google.com",
+    Referer: "https://notebooklm.google.com/",
+  };
 
-  // Fetch XSRF token from the live page (plain HTTP)
-  const { xsrf, sid } = await fetchXsrfToken(cookieHeader);
+  // ── Step 1: Try to get XSRF + sid from the homepage HTML ─────────────────
+  let xsrf = "";
+  let sid  = "";
+
+  try {
+    const pageRes = await fetch("https://notebooklm.google.com", {
+      headers: { ...commonHeaders, Accept: "text/html" },
+      redirect: "follow",
+    });
+    const html = await pageRes.text();
+    xsrf = extractXsrfFromHtml(html) ?? "";
+    sid  = extractSidFromHtml(html);
+  } catch {
+    // Network error — fall through to probe method
+  }
+
+  // ── Step 2: If still no XSRF, send a probe batchexecute and read the 400 ──
+  if (!xsrf) {
+    const RPC_URL = new URL("https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute");
+    RPC_URL.searchParams.set("rpcids", "wXbhsf");
+    RPC_URL.searchParams.set("source-path", "/");
+    RPC_URL.searchParams.set("bl", "boq_labs-tailwind-ui_20250101.00_p0");
+    RPC_URL.searchParams.set("hl", "en");
+    RPC_URL.searchParams.set("rt", "c");
+
+    const freq = JSON.stringify([[["wXbhsf", JSON.stringify([null]), null, "generic"]]]);
+    const body = `f.req=${encodeURIComponent(freq)}&at=PROBE&`;
+
+    const probeRes = await fetch(RPC_URL.toString(), {
+      method: "POST",
+      headers: { ...commonHeaders, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+      body,
+    });
+
+    const probeBody = await probeRes.text();
+
+    // Extract XSRF from error body
+    const probeXsrf = extractXsrfFromError(probeBody);
+    if (probeXsrf) {
+      xsrf = probeXsrf;
+    } else {
+      throw new Error(
+        `Could not obtain XSRF token.\nProbe response (${probeRes.status}): ${probeBody.slice(0, 300)}\n` +
+        "Session may have expired — please refresh NOTEBOOKLM_STORAGE_STATE."
+      );
+    }
+  }
 
   cache = { cookieHeader, csrfToken: xsrf, sapisidHash, sessionId: sid };
   return cache;
 }
 
+/** Call after an unexpected 400 so the next call re-fetches the token */
 export function invalidateCache(): void { cache = null; }
