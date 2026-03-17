@@ -113,6 +113,11 @@ export interface Notebook { id: string; title: string; url: string; sourceCount:
 export interface Source   { id: string; title: string; type: string }
 export interface Artifact { id: string; type: string; status: string }
 
+/** Public diagnostic: raw RPC call, returns unparsed response */
+export async function callRaw(auth: AuthTokens, methodId: string, params: unknown[]): Promise<unknown> {
+  return call(auth, methodId, params);
+}
+
 // ─── Notebook ops ─────────────────────────────────────────────────────────────
 export async function listNotebooks(auth: AuthTokens): Promise<Notebook[]> {
   const data = await call(auth, M.LIST_NOTEBOOKS, [null]) as unknown[][];
@@ -127,10 +132,35 @@ export async function listNotebooks(auth: AuthTokens): Promise<Notebook[]> {
 }
 
 export async function createNotebook(auth: AuthTokens, title: string): Promise<Notebook> {
-  const data = await call(auth, M.CREATE_NOTEBOOK, [title, null, null, [2], [1]]) as unknown[];
-  const id = String(Array.isArray(data) ? data[0] ?? "" : "");
-  if (!id) throw new Error("Create notebook: no ID returned");
-  return { id, title, url: `${BASE}/notebook/${id}`, sourceCount: 0 };
+  // Try param structures from most-likely to least-likely
+  // Based on notebooklm-py reverse engineering of Google batchexecute
+  const paramVariants = [
+    [title],                          // simplest: just title
+    [title, null],                    // title + null
+    [null, title],                    // null + title
+    [title, null, null],              // title, null, null
+    [title, null, null, null],        // with extra null
+    [[title]],                        // nested title
+  ];
+
+  let lastError = "";
+  for (const params of paramVariants) {
+    try {
+      const data = await call(auth, M.CREATE_NOTEBOOK, params) as unknown[];
+      // Look for a string ID in the response
+      const id = Array.isArray(data)
+        ? String(data.find((v) => typeof v === "string" && v.length > 5) ?? data[0] ?? "")
+        : "";
+      if (id && id !== "null" && id !== "undefined") {
+        return { id, title, url: `${BASE}/notebook/${id}`, sourceCount: 0 };
+      }
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+      // 400 without xsrf = wrong params, keep trying
+      if (!lastError.includes("400")) throw e;
+    }
+  }
+  throw new Error(`createNotebook failed after trying all param variants. Last error: ${lastError}`);
 }
 
 export async function getNotebook(auth: AuthTokens, notebookId: string): Promise<Notebook> {

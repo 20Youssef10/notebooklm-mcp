@@ -141,6 +141,23 @@ const handler = createMcpHandler(
       }
     );
 
+    server.tool("notebooklm_probe_rpc", "Diagnostic: test a raw RPC call and return the response. Used to discover correct params.",
+      {
+        method_id: z.string().describe("RPC method ID e.g. YEiWtc"),
+        params_json: z.string().describe("JSON array of params e.g. [\"My Title\"]"),
+      },
+      async (p: { method_id: string; params_json: string }) => {
+        try {
+          const { buildAuthTokens } = await import("@/src/notebooklm/rpc");
+          const { callRaw } = await import("@/src/notebooklm/api");
+          const auth = await buildAuthTokens();
+          const params = JSON.parse(p.params_json) as unknown[];
+          const result = await callRaw(auth, p.method_id, params);
+          return ok({ raw: result });
+        } catch (e) { return err(e); }
+      }
+    );
+
     server.tool("notebooklm_health_check", "Verify authentication and API connectivity.", {}, async () => {
       try {
         const auth = await buildAuthTokens();
