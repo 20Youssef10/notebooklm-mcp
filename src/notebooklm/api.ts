@@ -95,20 +95,34 @@ async function call(auth: AuthTokens, methodId: string, params: unknown[], noteb
 }
 
 function parseResp(text: string): unknown {
-  // batchexecute format: [["wrb.fr", METHOD_ID, DATA_JSON_STRING, ...], ...]
-  // DATA is at row[2], not row[1]
-  const clean = text.replace(/^\)\]\}'\n/, "").trim();
-  try {
-    const outer = JSON.parse(clean) as unknown[][];
-    for (const row of outer) {
-      if (!Array.isArray(row)) continue;
-      // Standard batchexecute: ["wrb.fr", methodId, dataJsonString, ...]
-      if (row[0] === "wrb.fr" && typeof row[2] === "string") {
-        try { return JSON.parse(row[2]); } catch { return row[2]; }
+  // batchexecute response format (chunked transfer encoding):
+  // )]}'\n
+  // 319\n                   ← chunk byte size (SKIP)
+  // [["wrb.fr","METHOD","DATA_JSON",...],...] ← actual JSON
+  // 25\n
+  // [["e",4,...]]
+  //
+  // Strategy: find ALL lines that start with "[" and try to parse them.
+  // Pick the one that contains a "wrb.fr" row.
+
+  const lines = text.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("[")) continue;
+    try {
+      const outer = JSON.parse(trimmed) as unknown[][];
+      if (!Array.isArray(outer)) continue;
+      for (const row of outer) {
+        if (!Array.isArray(row)) continue;
+        // ["wrb.fr", methodId, dataJsonString, ...]
+        if (row[0] === "wrb.fr" && typeof row[2] === "string") {
+          try { return JSON.parse(row[2]); } catch { return row[2]; }
+        }
       }
-    }
-    return outer;
-  } catch { return text; }
+    } catch { continue; }
+  }
+  // Fallback: return raw text so error message includes it
+  return text;
 }
 
 /** Public diagnostic */
