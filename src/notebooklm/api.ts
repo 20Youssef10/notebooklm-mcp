@@ -140,22 +140,30 @@ export async function listNotebooks(auth: AuthTokens): Promise<Notebook[]> {
   const data = await call(auth, M.LIST_NOTEBOOKS, [null]);
   if (!Array.isArray(data)) return [];
 
-  // Response: data[0] = array of notebook entries
-  // Each entry: [title, sources_array_or_null, notebook_id, ...]
-  //   r[0] = title (string)
-  //   r[1] = sources array: [[[sourceId], sourceTitle, ...], ...] or null
-  //   r[2] = notebook ID (UUID string)
+  // Log FULL first entry to understand the exact structure
   const entries = (Array.isArray(data[0]) && Array.isArray((data[0] as unknown[][])[0]))
     ? data[0] as unknown[][]
     : data as unknown[][];
+  
+  if (entries.length > 0) {
+    console.log("[listNotebooks] FIRST ENTRY FULL:", JSON.stringify(entries[0]));
+    console.log("[listNotebooks] ENTRY COUNT:", entries.length);
+  }
 
   return entries
     .filter(Array.isArray)
     .map((r) => {
-      const id    = typeof r[2] === "string" && r[2].includes("-") ? r[2] : "";
       const title = typeof r[0] === "string" ? r[0] : "Untitled";
-      // r[1] = sources array (each source is [[id], title, ...])
+      // Sources at r[1]
       const sourceCount = Array.isArray(r[1]) ? (r[1] as unknown[]).length : 0;
+
+      // ID: try r[2] as string, r[2] as [id], r[3] as string, scan all
+      let id = "";
+      for (let i = 2; i < Math.min((r as unknown[]).length, 6); i++) {
+        const v = r[i];
+        if (typeof v === "string" && v.includes("-") && v.length > 10) { id = v; break; }
+        if (Array.isArray(v) && typeof v[0] === "string" && (v[0] as string).includes("-")) { id = v[0] as string; break; }
+      }
       if (!id) return null;
       return { id, title, url: `${BASE}/notebook/${id}`, sourceCount };
     })
@@ -236,19 +244,20 @@ export async function addSourceUrl(auth: AuthTokens, notebookId: string, url: st
   ];
 
   let lastErr = "";
-  for (const params of variants) {
+  for (let i = 0; i < variants.length; i++) {
+    const params = variants[i];
     try {
       const data = await call(auth, M.ADD_SOURCE, params, notebookId);
-      const raw = JSON.stringify(data).slice(0, 300);
-      console.log("[addSourceUrl] SUCCESS params:", JSON.stringify(params).slice(0, 100), "raw:", raw);
+      const raw = JSON.stringify(data);
+      console.log(`[addSourceUrl] VARIANT_${i}_SUCCESS params:${JSON.stringify(params).slice(0,100)} raw:${raw.slice(0,300)}`);
       return { success: true, message: `Added ${isYT ? "YouTube" : "URL"}: ${url}` };
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e);
-      console.log("[addSourceUrl] FAIL params:", JSON.stringify(params).slice(0, 80), "err:", lastErr.slice(0, 80));
+      console.log(`[addSourceUrl] VARIANT_${i}_FAIL err:${lastErr.slice(0,120)}`);
       if (!lastErr.includes("400")) throw e;
     }
   }
-  throw new Error(`addSourceUrl: all variants failed. Last error: ${lastErr}`);
+  throw new Error(`addSourceUrl: all ${variants.length} variants failed. Last: ${lastErr}`);
 }
 
 export async function addSourceText(auth: AuthTokens, notebookId: string, content: string, title = "Pasted text"): Promise<{ success: boolean; message: string }> {
