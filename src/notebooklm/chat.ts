@@ -1,172 +1,95 @@
-import { withPage, guardAuth } from "../browser";
+/**
+ * Chat uses a streaming RPC endpoint separate from batchexecute.
+ * POST /_/LabsTailwindUi/data/google.internal.labs.tailwind.orchestration.v1.LabsTailwindOrchestrationService/GenerateFreeFormStreamed
+ */
+import { getAuthTokens } from "../rpc";
 
-const BASE_URL = "https://notebooklm.google.com";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-export interface ChatMessage {
-  role: "user" | "assistant";
-  content: string;
-}
+const CHAT_URL =
+  "https://notebooklm.google.com/_/LabsTailwindUi/data/google.internal.labs.tailwind.orchestration.v1.LabsTailwindOrchestrationService/GenerateFreeFormStreamed";
 
 export interface ChatResponse {
   answer: string;
   citations: string[];
 }
 
-// ─── Ask a single question ────────────────────────────────────────────────────
-
 export async function askQuestion(
   notebookId: string,
-  question: string,
-  timeoutMs = 60_000
+  question: string
 ): Promise<ChatResponse> {
-  return withPage(async (page) => {
-    await guardAuth(page, `${BASE_URL}/notebook/${notebookId}`);
-    await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
+  const auth = await getAuthTokens();
 
-    // Find the chat input
-    const inputSelector = [
-      "textarea[placeholder*='Ask']",
-      "textarea[placeholder*='ask']",
-      "textarea[placeholder*='question']",
-      "[contenteditable='true'][class*='chat']",
-      "[contenteditable='true'][aria-label*='Ask']",
-      "[data-test-id='chat-input']",
-      "form textarea",
-    ].join(", ");
+  // Build the streaming request payload
+  const payload = JSON.stringify([
+    question,
+    null,
+    notebookId,
+    null,
+    null,
+    null,
+    null,
+    null,
+    [1],
+  ]);
 
-    const chatInput = await page.waitForSelector(inputSelector, { timeout: 20_000 });
+  const body = `f.req=${encodeURIComponent(JSON.stringify([[payload]]))}`;
 
-    // Type the question
-    await chatInput.click();
-    await chatInput.fill(question);
-
-    // Count existing responses BEFORE sending
-    const beforeCount = await page
-      .$$eval("[class*='response'], [class*='answer'], [class*='assistant']", (els) => els.length)
-      .catch(() => 0);
-
-    // Send: try submit button first, then Enter
-    const submitSelector = [
-      "button[aria-label*='Send']",
-      "button[aria-label*='submit']",
-      "button[type='submit']",
-      "button:has(mat-icon:has-text('send'))",
-      "[data-test-id='send-button']",
-    ].join(", ");
-
-    const submitBtn = await page.$(submitSelector);
-    if (submitBtn) {
-      await submitBtn.click();
-    } else {
-      await page.keyboard.press("Enter");
-    }
-
-    // Wait for a NEW response to appear (poll until count increases)
-    const deadline = Date.now() + timeoutMs;
-    let answerEl: import("playwright-core").Locator | null = null;
-
-    while (Date.now() < deadline) {
-      await page.waitForTimeout(1_500);
-
-      const afterCount = await page
-        .$$eval("[class*='response'], [class*='answer'], [class*='assistant']", (els) => els.length)
-        .catch(() => 0);
-
-      if (afterCount > beforeCount) {
-        // Grab the last response element
-        const responses = page.locator("[class*='response'], [class*='answer'], [class*='assistant']");
-        answerEl = responses.last();
-        break;
-      }
-
-      // Also check for a "typing" indicator disappearing
-      const isTyping = await page
-        .$("[class*='typing'], [class*='loading'], [aria-label*='loading']")
-        .then((el) => el !== null)
-        .catch(() => false);
-
-      if (!isTyping && afterCount > 0) {
-        const responses = page.locator("[class*='response'], [class*='answer'], [class*='assistant']");
-        answerEl = responses.last();
-        break;
-      }
-    }
-
-    if (!answerEl) {
-      throw new Error(
-        `No response received within ${timeoutMs / 1000}s. ` +
-          "The notebook may have no sources loaded yet."
-      );
-    }
-
-    // Extract the answer text
-    const answer = await answerEl.innerText().catch(() => "");
-
-    // Extract citation references (numbered superscripts or [N] patterns)
-    const citations = await page
-      .$$eval(
-        "[class*='citation'], [class*='footnote'], sup, [data-citation]",
-        (els) => [...new Set(els.map((el) => el.textContent?.trim()).filter(Boolean))] as string[]
-      )
-      .catch(() => [] as string[]);
-
-    return { answer: answer.trim(), citations };
+  const response = await fetch(CHAT_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+      Cookie: auth.cookies,
+      Referer: `https://notebooklm.google.com/notebook/${notebookId}`,
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    },
+    body: `${body}&at=${encodeURIComponent(auth.csrfToken)}&`,
   });
+
+  if (!response.ok) {
+    throw new Error(`Chat request failed: HTTP ${response.status}`);
+  }
+
+  const text = await response.text();
+
+  // Parse streaming response — find the last complete JSON chunk with text
+  const lines = text.split("\n").filter((l) => l.startsWith("["));
+  let answer = "";
+  const citations: string[] = [];
+
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line) as unknown[][];
+      // Walk through looking for text content
+      const walk = (obj: unknown): void => {
+        if (typeof obj === "string" && obj.length > 20 && !obj.startsWith("http")) {
+          if (obj.length > answer.length) answer = obj;
+        }
+        if (Array.isArray(obj)) obj.forEach(walk);
+      };
+      walk(parsed);
+    } catch {
+      continue;
+    }
+  }
+
+  if (!answer) {
+    // Fallback: return raw text excerpt
+    answer = text.slice(0, 500).replace(/[^\w\s.,?!-]/g, "").trim();
+  }
+
+  return { answer, citations };
 }
 
-// ─── Multi-turn conversation ──────────────────────────────────────────────────
-
-/**
- * Run multiple questions sequentially in the same browser session.
- * Useful for multi-turn research workflows.
- */
 export async function conversation(
   notebookId: string,
-  messages: string[]
+  questions: string[]
 ): Promise<ChatResponse[]> {
   const results: ChatResponse[] = [];
-
-  return withPage(async (page) => {
-    await guardAuth(page, `${BASE_URL}/notebook/${notebookId}`);
-    await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
-
-    for (const question of messages) {
-      // Ask
-      const inputSelector = [
-        "textarea[placeholder*='Ask']",
-        "textarea[placeholder*='ask']",
-        "[contenteditable='true']",
-        "form textarea",
-      ].join(", ");
-
-      const chatInput = await page.waitForSelector(inputSelector, { timeout: 15_000 });
-      await chatInput.click();
-      await chatInput.fill(question);
-
-      const beforeCount = await page
-        .$$eval("[class*='response'], [class*='answer']", (els) => els.length)
-        .catch(() => 0);
-
-      await page.keyboard.press("Enter");
-
-      // Wait for new response
-      for (let i = 0; i < 40; i++) {
-        await page.waitForTimeout(1_500);
-        const afterCount = await page
-          .$$eval("[class*='response'], [class*='answer']", (els) => els.length)
-          .catch(() => 0);
-        if (afterCount > beforeCount) break;
-      }
-
-      const responses = page.locator("[class*='response'], [class*='answer']");
-      const last = responses.last();
-      const answer = await last.innerText().catch(() => "");
-
-      results.push({ answer: answer.trim(), citations: [] });
-    }
-
-    return results;
-  });
+  for (const q of questions) {
+    const r = await askQuestion(notebookId, q);
+    results.push(r);
+    // Small delay between questions to avoid rate limiting
+    await new Promise((res) => setTimeout(res, 1500));
+  }
+  return results;
 }

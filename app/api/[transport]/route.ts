@@ -408,29 +408,27 @@ const handler = createMcpHandler(
 
     server.tool(
       "notebooklm_health_check",
-      "Check if the NotebookLM MCP server can connect to Browserless.io and verify the stored Google session is still valid.",
+      "Check if the NotebookLM MCP server env vars are set and the Google session is valid by listing notebooks.",
       {},
       async () => {
         try {
-          const { chromium } = await import("playwright-core");
-          const token = process.env.BROWSERLESS_TOKEN;
-          if (!token) throw new Error("BROWSERLESS_TOKEN is not set.");
+          const raw = process.env.NOTEBOOKLM_STORAGE_STATE;
+          if (!raw) throw new Error("NOTEBOOKLM_STORAGE_STATE is not set.");
+          const browserlessToken = process.env.BROWSERLESS_TOKEN;
+          if (!browserlessToken) throw new Error("BROWSERLESS_TOKEN is not set.");
 
-          const { loadStorageState } = await import("@/src/browser");
-          const storageState = loadStorageState(); // throws if missing / invalid
+          // Parse cookies
+          const storageState = JSON.parse(Buffer.from(raw, "base64").toString("utf-8"));
+          const cookieCount = storageState.cookies?.length ?? 0;
 
-          const wsEndpoint = `wss://production-${process.env.BROWSERLESS_REGION ?? "sfo"}.browserless.io?token=${token}&stealth=true`;
-
-          const browser = await chromium.connectOverCDP(wsEndpoint);
-          const version = await browser.version();
-          await browser.close();
-
-          const cookieCount = storageState.cookies.length;
+          // Try listing notebooks to validate the session
+          const notebooks = await listNotebooks();
 
           return ok({
             status: "healthy",
-            browserless: { connected: true, version },
-            session: { cookies: cookieCount, valid: cookieCount > 0 },
+            session: { cookies: cookieCount, valid: true },
+            browserless: { configured: true },
+            notebooks: { count: notebooks.length },
           });
         } catch (e) {
           return err(e);
