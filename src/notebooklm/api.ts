@@ -134,10 +134,28 @@ export async function listNotebooks(auth: AuthTokens): Promise<Notebook[]> {
 }
 
 export async function createNotebook(auth: AuthTokens, title: string): Promise<Notebook> {
-  // Verified params from rpc-reference.md: [title, None, None, [2], [1]]
-  const data = await call(auth, M.CREATE_NOTEBOOK, [title, null, null, [2], [1]]) as unknown[];
-  const id = String(Array.isArray(data) ? (data[0] ?? "") : "");
-  if (!id || id === "null") throw new Error("createNotebook: no ID returned from API");
+  const data = await call(auth, M.CREATE_NOTEBOOK, [title, null, null, [2], [1]]);
+  const raw = JSON.stringify(data);
+  console.log("[createNotebook] raw:", raw.slice(0, 600));
+
+  // Recursively find a string that looks like a NotebookLM ID
+  const findId = (obj: unknown, depth = 0): string => {
+    if (depth > 5) return "";
+    if (typeof obj === "string") {
+      const s = obj.trim();
+      if (s.length >= 8 && s.length <= 60 && /^[a-zA-Z0-9_-]+$/.test(s) && s !== title) return s;
+    }
+    if (Array.isArray(obj)) {
+      for (const v of obj) { const r = findId(v, depth + 1); if (r) return r; }
+    }
+    if (obj && typeof obj === "object") {
+      for (const v of Object.values(obj as Record<string,unknown>)) { const r = findId(v, depth + 1); if (r) return r; }
+    }
+    return "";
+  };
+
+  const id = findId(data);
+  if (!id) throw new Error("createNotebook: no ID in response. Raw: " + raw.slice(0, 400));
   return { id, title, url: `${BASE}/notebook/${id}`, sourceCount: 0 };
 }
 
