@@ -1,6 +1,8 @@
 /**
- * NotebookLM API — using verified RPC method IDs from notebooklm-py
- * Source: github.com/teng-lin/notebooklm-py/blob/main/docs/rpc-reference.md
+ * NotebookLM API
+ * All params verified from notebooklm-py source code:
+ * /usr/local/lib/python3.12/dist-packages/notebooklm/_notebooks.py
+ * /usr/local/lib/python3.12/dist-packages/notebooklm/_sources.py
  */
 import type { AuthTokens } from "./rpc";
 import { invalidateCache } from "./rpc";
@@ -8,44 +10,27 @@ import { invalidateCache } from "./rpc";
 const BASE    = "https://notebooklm.google.com";
 const RPC_URL = `${BASE}/_/LabsTailwindUi/data/batchexecute`;
 
-// ─── Verified RPC method IDs ──────────────────────────────────────────────────
+// Verified method IDs from notebooklm-py rpc/types.py
 const M = {
-  // Notebooks
-  LIST_NOTEBOOKS:   "wXbhsf",
-  CREATE_NOTEBOOK:  "CCqFvf",   // was YEiWtc ← WRONG
-  GET_NOTEBOOK:     "rLM1Ne",   // was RnFq6b ← WRONG
-  RENAME_NOTEBOOK:  "s0tc2d",   // was QKPgb   ← WRONG
-  DELETE_NOTEBOOK:  "WWINqb",   // was FMnFhe  ← WRONG
-  // Sources
-  ADD_SOURCE:       "izAoDd",   // was qkBFPd  ← WRONG
-  DELETE_SOURCE:    "tGMBJ",    // was mOjoCb  ← WRONG
-  GET_SOURCE:       "hizoJc",
-  // Summary
-  SUMMARIZE:        "VfAZjd",
-  // Artifacts
-  CREATE_ARTIFACT:  "R7cb6c",
-  LIST_ARTIFACTS:   "gArtLc",   // was wQBFkf  ← WRONG
-  DELETE_ARTIFACT:  "V5N4be",
-  // Mind map
-  GENERATE_MIND_MAP:"yyryJe",
-  // Notes/conversation
-  GET_NOTES_MAPS:   "cFji9",
-  GET_CONVERSATION: "hPTbtc",
+  LIST_NOTEBOOKS:    "wXbhsf",
+  CREATE_NOTEBOOK:   "CCqFvf",
+  GET_NOTEBOOK:      "rLM1Ne",
+  RENAME_NOTEBOOK:   "s0tc2d",
+  DELETE_NOTEBOOK:   "WWINqb",
+  ADD_SOURCE:        "izAoDd",
+  ADD_SOURCE_FILE:   "o4cbdc",
+  DELETE_SOURCE:     "tGMBJ",
+  GET_SOURCE:        "hizoJc",
+  SUMMARIZE:         "VfAZjd",
+  CREATE_ARTIFACT:   "R7cb6c",
+  LIST_ARTIFACTS:    "gArtLc",
+  GENERATE_MIND_MAP: "yyryJe",
+  GET_CONVERSATION:  "hPTbtc",
 } as const;
 
-// Artifact type codes (from ArtifactTypeCode enum)
-const AT = {
-  AUDIO:      1,
-  REPORT:     2,  // study guide, briefing, blog post...
-  VIDEO:      3,
-  QUIZ:       4,  // also flashcards
-  MIND_MAP:   5,
-  INFOGRAPHIC:7,
-  SLIDE_DECK: 8,
-  DATA_TABLE: 9,
-} as const;
+const AT = { AUDIO:1, REPORT:2, VIDEO:3, QUIZ:4, SLIDE_DECK:8 } as const;
 
-// ─── Core HTTP ────────────────────────────────────────────────────────────────
+// ─── HTTP core ────────────────────────────────────────────────────────────────
 async function doFetch(auth: AuthTokens, methodId: string, params: unknown[], notebookId?: string): Promise<Response> {
   const url = new URL(RPC_URL);
   url.searchParams.set("rpcids", methodId);
@@ -76,7 +61,6 @@ async function doFetch(auth: AuthTokens, methodId: string, params: unknown[], no
 async function call(auth: AuthTokens, methodId: string, params: unknown[], notebookId?: string): Promise<unknown> {
   let res = await doFetch(auth, methodId, params, notebookId);
 
-  // On 400: Google embeds the fresh XSRF in the error body — retry with it
   if (res.status === 400) {
     const errBody = await res.text();
     const xsrfMatch = errBody.match(/"xsrf"\s*,\s*"([^"]+)"/);
@@ -84,7 +68,7 @@ async function call(auth: AuthTokens, methodId: string, params: unknown[], noteb
       invalidateCache();
       const freshAuth = { ...auth, csrfToken: xsrfMatch[1] };
       res = await doFetch(freshAuth, methodId, params, notebookId);
-      if (!res.ok) throw new Error(`RPC ${methodId} → HTTP ${res.status} (after xsrf retry): ${(await res.text()).slice(0,300)}`);
+      if (!res.ok) throw new Error(`RPC ${methodId} → HTTP ${res.status} (xsrf retry): ${(await res.text()).slice(0,300)}`);
       return parseResp(await res.text());
     }
     throw new Error(`RPC ${methodId} → HTTP 400: ${errBody.slice(0,400)}`);
@@ -95,244 +79,200 @@ async function call(auth: AuthTokens, methodId: string, params: unknown[], noteb
 }
 
 function parseResp(text: string): unknown {
-  // batchexecute response format (chunked transfer encoding):
-  // )]}'\n
-  // 319\n                   ← chunk byte size (SKIP)
-  // [["wrb.fr","METHOD","DATA_JSON",...],...] ← actual JSON
-  // 25\n
-  // [["e",4,...]]
-  //
-  // Strategy: find ALL lines that start with "[" and try to parse them.
-  // Pick the one that contains a "wrb.fr" row.
-
-  const lines = text.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("[")) continue;
+  // Chunked: skip lines that are just numbers (chunk sizes), parse lines starting with "["
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("[")) continue;
     try {
-      const outer = JSON.parse(trimmed) as unknown[][];
-      if (!Array.isArray(outer)) continue;
+      const outer = JSON.parse(t) as unknown[][];
       for (const row of outer) {
-        if (!Array.isArray(row)) continue;
-        // ["wrb.fr", methodId, dataJsonString, ...]
-        if (row[0] === "wrb.fr" && typeof row[2] === "string") {
+        if (Array.isArray(row) && row[0] === "wrb.fr" && typeof row[2] === "string") {
           try { return JSON.parse(row[2]); } catch { return row[2]; }
         }
       }
     } catch { continue; }
   }
-  // Fallback: return raw text so error message includes it
   return text;
 }
 
-/** Public diagnostic */
 export async function callRaw(auth: AuthTokens, methodId: string, params: unknown[]): Promise<unknown> {
   return call(auth, methodId, params);
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 export interface Notebook { id: string; title: string; url: string; sourceCount: number }
-export interface Source   { id: string; title: string; type: string; status: string }
+export interface Source   { id: string; title: string; url: string | null; status: string }
 export interface Artifact { id: string; type: string; status: string; title: string }
 
 // ─── Notebooks ────────────────────────────────────────────────────────────────
+
 export async function listNotebooks(auth: AuthTokens): Promise<Notebook[]> {
-  const data = await call(auth, M.LIST_NOTEBOOKS, [null]);
+  // Verified params from _notebooks.py list(): [None, 1, None, [2]]
+  const data = await call(auth, M.LIST_NOTEBOOKS, [null, 1, null, [2]]);
   if (!Array.isArray(data)) return [];
 
-  // Log FULL first entry to understand the exact structure
-  const entries = (Array.isArray(data[0]) && Array.isArray((data[0] as unknown[][])[0]))
-    ? data[0] as unknown[][]
+  // Response: [[nb1, nb2, ...], ...]   where nb = [title, sources, id, ...]
+  const raw = data[0];
+  const entries: unknown[][] = Array.isArray(raw) && Array.isArray((raw as unknown[][])[0])
+    ? raw as unknown[][]
     : data as unknown[][];
-  
-  if (entries.length > 0) {
-    console.log("[listNotebooks] FIRST ENTRY FULL:", JSON.stringify(entries[0]));
-    console.log("[listNotebooks] ENTRY COUNT:", entries.length);
-  }
 
-  return entries
-    .filter(Array.isArray)
-    .map((r) => {
-      const title = typeof r[0] === "string" ? r[0] : "Untitled";
-      // Sources at r[1]
-      const sourceCount = Array.isArray(r[1]) ? (r[1] as unknown[]).length : 0;
-
-      // ID: try r[2] as string, r[2] as [id], r[3] as string, scan all
-      let id = "";
-      for (let i = 2; i < Math.min((r as unknown[]).length, 6); i++) {
-        const v = r[i];
-        if (typeof v === "string" && v.includes("-") && v.length > 10) { id = v; break; }
-        if (Array.isArray(v) && typeof v[0] === "string" && (v[0] as string).includes("-")) { id = v[0] as string; break; }
-      }
-      if (!id) return null;
-      return { id, title, url: `${BASE}/notebook/${id}`, sourceCount };
-    })
-    .filter(Boolean) as Notebook[];
+  return entries.filter(Array.isArray).flatMap((r) => {
+    // r[0]=title, r[1]=sources_array_or_null, r[2]=id
+    const title = typeof r[0] === "string" ? r[0] : "Untitled";
+    const id    = typeof r[2] === "string" && r[2].includes("-") ? r[2] : "";
+    const sourceCount = Array.isArray(r[1]) ? (r[1] as unknown[]).length : 0;
+    if (!id) return [];
+    return [{ id, title, url: `${BASE}/notebook/${id}`, sourceCount }];
+  });
 }
 
 export async function createNotebook(auth: AuthTokens, title: string): Promise<Notebook> {
-  // Response: ["AI Development Notes", null, "c541cf08-bdc9-...", null, null, [...]]
-  // ID is at index 2 of the parsed inner array
+  // Verified params from _notebooks.py create(): [title, None, None, [2], [1]]
   const data = await call(auth, M.CREATE_NOTEBOOK, [title, null, null, [2], [1]]) as unknown[];
-  const raw = JSON.stringify(data);
-
-  let id = "";
-  if (Array.isArray(data)) {
-    // data[2] is the notebook ID (UUID format)
-    if (typeof data[2] === "string" && data[2].length > 5) {
-      id = data[2];
-    } else {
-      // Fallback: find first UUID-like string
-      for (const v of data) {
-        if (typeof v === "string" && /^[0-9a-f-]{8,}$/i.test(v)) { id = v; break; }
-      }
-    }
-  }
-
-  if (!id) throw new Error("createNotebook: no ID in response. Raw: " + raw.slice(0, 400));
+  // Response shape matches a notebook entry: [title, null, id, ...]
+  const id = typeof data[2] === "string" ? data[2] : "";
+  if (!id) throw new Error(`createNotebook: no ID in response. Raw: ${JSON.stringify(data).slice(0,300)}`);
   return { id, title, url: `${BASE}/notebook/${id}`, sourceCount: 0 };
 }
 
 export async function getNotebook(auth: AuthTokens, notebookId: string): Promise<Notebook> {
-  const data = await call(auth, M.GET_NOTEBOOK, [notebookId], notebookId) as unknown[];
-  return {
-    id:          notebookId,
-    title:       String(Array.isArray(data) ? (data[1] ?? "Untitled") : "Untitled"),
-    url:         `${BASE}/notebook/${notebookId}`,
-    sourceCount: Array.isArray(data) && typeof data[6] === "number" ? data[6] : 0,
-  };
+  // Verified params from _notebooks.py get(): [notebookId, None, [2], None, 0]
+  const data = await call(auth, M.GET_NOTEBOOK, [notebookId, null, [2], null, 0], notebookId) as unknown[][];
+  // get() returns [nb_info, ...] where nb_info is the notebook array
+  const nb = Array.isArray(data[0]) ? data[0] as unknown[] : data as unknown[];
+  const title = typeof nb[0] === "string" ? nb[0] : "Untitled";
+  const sourceCount = Array.isArray(nb[1]) ? (nb[1] as unknown[]).length : 0;
+  return { id: notebookId, title, url: `${BASE}/notebook/${notebookId}`, sourceCount };
 }
 
 export async function deleteNotebook(auth: AuthTokens, notebookId: string): Promise<void> {
-  await call(auth, M.DELETE_NOTEBOOK, [[notebookId]], notebookId);
+  // Verified params from _notebooks.py delete(): [[notebookId], [2]]
+  await call(auth, M.DELETE_NOTEBOOK, [[notebookId], [2]], notebookId);
 }
 
 export async function renameNotebook(auth: AuthTokens, notebookId: string, newTitle: string): Promise<void> {
-  await call(auth, M.RENAME_NOTEBOOK, [notebookId, newTitle], notebookId);
+  // Verified params from _notebooks.py rename(): [notebookId, [[None, None, None, [None, newTitle]]]]
+  await call(auth, M.RENAME_NOTEBOOK, [notebookId, [[null, null, null, [null, newTitle]]]], notebookId);
 }
 
 // ─── Sources ──────────────────────────────────────────────────────────────────
+
 export async function listSources(auth: AuthTokens, notebookId: string): Promise<Source[]> {
-  // GET_NOTEBOOK returns same shape as a single LIST_NOTEBOOKS entry
-  // r[1] = sources: [[[sourceId], title, metadata, ...], ...]
-  const data = await call(auth, M.GET_NOTEBOOK, [notebookId], notebookId) as unknown[][];
+  // Uses GET_NOTEBOOK then reads nb_info[1] for sources
+  // Verified from _sources.py list(): params = [notebook_id, None, [2], None, 0]
+  const data = await call(auth, M.GET_NOTEBOOK, [notebookId, null, [2], null, 0], notebookId) as unknown[][];
   if (!Array.isArray(data)) return [];
-  const srcList = Array.isArray(data[1]) ? data[1] as unknown[][] : [];
-  return srcList.filter(Array.isArray).map((s, i) => ({
-    // s[0] = [sourceId] (wrapped), s[1] = title
-    id:     Array.isArray(s[0]) ? String((s[0] as unknown[])[0] ?? i) : String(s[0] ?? i),
-    title:  String(s[1] ?? "Source"),
-    type:   "unknown",
-    status: "unknown",
-  }));
+  const nbInfo = Array.isArray(data[0]) ? data[0] as unknown[] : data as unknown[];
+  const srcList = Array.isArray(nbInfo[1]) ? nbInfo[1] as unknown[][] : [];
+
+  return srcList.filter(Array.isArray).map((s, i) => {
+    // Verified from _sources.py: src_id = src[0][0] if src[0] is list
+    const id    = Array.isArray(s[0]) ? String((s[0] as unknown[])[0] ?? i) : String(s[0] ?? i);
+    const title = typeof s[1] === "string" ? s[1] : "Source";
+    // URL at src[2][7][0]
+    let url: string | null = null;
+    if (Array.isArray(s[2]) && Array.isArray((s[2] as unknown[])[7])) {
+      const urlArr = (s[2] as unknown[])[7] as unknown[];
+      url = typeof urlArr[0] === "string" ? urlArr[0] : null;
+    }
+    // Status at src[3][1]
+    const statusCode = Array.isArray(s[3]) ? (s[3] as unknown[])[1] : null;
+    const status = statusCode === 2 ? "ready" : statusCode === 1 ? "processing" : "unknown";
+    return { id, title, url, status };
+  });
 }
 
 export async function addSourceUrl(auth: AuthTokens, notebookId: string, url: string): Promise<{ success: boolean; message: string }> {
   const isYT = /youtube\.com|youtu\.be/.test(url);
-  const srcType = isYT ? 6 : 1;
 
-  // Correct params from notebooklm-py rpc-reference + confirmed source shape:
-  // sources in GET_NOTEBOOK response are: [[sourceId], title, metadata]
-  // ADD_SOURCE (izAoDd) variants to try — most likely first:
-  const variants: unknown[][] = [
-    [notebookId, [null, [[srcType, url]]]],           // wrap with null
-    [notebookId, [[srcType, url]]],                   // direct array
-    [notebookId, null, [[srcType, url]]],             // null between
-    [notebookId, [[[srcType, url]]]],                 // triple nested
-    [notebookId, [[srcType, url, null]]],             // with trailing null
-    [[notebookId], [[srcType, url]]],                 // ID as array
-  ];
+  const params = isYT
+    // Verified from _sources.py _add_youtube_source():
+    // [[[None,None,None,None,None,None,None,[url],None,None,1]], notebookId, [2], [1,...]]
+    ? [
+        [[null, null, null, null, null, null, null, [url], null, null, 1]],
+        notebookId,
+        [2],
+        [1, null, null, null, null, null, null, null, null, null, [1]],
+      ]
+    // Verified from _sources.py _add_url_source():
+    // [[[None,None,[url],None,None,None,None,None]], notebookId, [2], None, None]
+    : [
+        [[null, null, [url], null, null, null, null, null]],
+        notebookId,
+        [2],
+        null,
+        null,
+      ];
 
-  let lastErr = "";
-  for (let i = 0; i < variants.length; i++) {
-    const params = variants[i];
-    try {
-      const data = await call(auth, M.ADD_SOURCE, params, notebookId);
-      const raw = JSON.stringify(data);
-      console.log(`[addSourceUrl] VARIANT_${i}_SUCCESS params:${JSON.stringify(params).slice(0,100)} raw:${raw.slice(0,300)}`);
-      return { success: true, message: `Added ${isYT ? "YouTube" : "URL"}: ${url}` };
-    } catch (e) {
-      lastErr = e instanceof Error ? e.message : String(e);
-      console.log(`[addSourceUrl] VARIANT_${i}_FAIL err:${lastErr.slice(0,120)}`);
-      if (!lastErr.includes("400")) throw e;
-    }
-  }
-  throw new Error(`addSourceUrl: all ${variants.length} variants failed. Last: ${lastErr}`);
+  await call(auth, M.ADD_SOURCE, params, notebookId);
+  return { success: true, message: `Added ${isYT ? "YouTube" : "URL"}: ${url}` };
 }
 
 export async function addSourceText(auth: AuthTokens, notebookId: string, content: string, title = "Pasted text"): Promise<{ success: boolean; message: string }> {
-  const data = await call(auth, M.ADD_SOURCE, [notebookId, [[3, content, title]]], notebookId);
-  console.log("[addSourceText] raw:", JSON.stringify(data).slice(0, 200));
+  // Verified from _sources.py add_text():
+  // [[[None, [title, content], None, None, None, None, None, None]], notebookId, [2], None, None]
+  await call(auth, M.ADD_SOURCE, [
+    [[null, [title, content], null, null, null, null, null, null]],
+    notebookId,
+    [2],
+    null,
+    null,
+  ], notebookId);
   return { success: true, message: `Text source "${title}" added.` };
 }
 
 export async function deleteSource(auth: AuthTokens, notebookId: string, sourceId: string): Promise<{ success: boolean; message: string }> {
-  await call(auth, M.DELETE_SOURCE, [notebookId, [sourceId]], notebookId);
+  // Verified from _sources.py delete(): params = [[[source_id]]]
+  await call(auth, M.DELETE_SOURCE, [[[sourceId]]], notebookId);
   return { success: true, message: `Source ${sourceId} deleted.` };
 }
 
 // ─── Summary ──────────────────────────────────────────────────────────────────
 export async function getNotebookSummary(auth: AuthTokens, notebookId: string): Promise<string> {
   const data = await call(auth, M.SUMMARIZE, [notebookId, [2]], notebookId) as unknown[][];
-  return Array.isArray(data) && Array.isArray(data[0]) ? String(data[0][0] ?? "No summary.") : "No summary.";
+  return Array.isArray(data) && Array.isArray(data[0]) ? String((data[0] as unknown[])[0] ?? "No summary.") : "No summary.";
 }
 
-// ─── Artifact generation ─────────────────────────────────────────────────────
-async function createArtifact(auth: AuthTokens, notebookId: string, typeCode: number, label: string, extra: unknown[] = []) {
-  // CREATE_ARTIFACT params: [notebook_id, artifact_type_code, ...extra]
+// ─── Artifacts ────────────────────────────────────────────────────────────────
+async function artifact(auth: AuthTokens, notebookId: string, typeCode: number, label: string, extra: unknown[] = []) {
   const data = await call(auth, M.CREATE_ARTIFACT, [notebookId, typeCode, ...extra], notebookId) as unknown[];
   const artifactId = Array.isArray(data) ? String(data[0] ?? "") : "";
-  return {
-    type: label,
-    status: "started",
-    artifactId: artifactId || undefined,
-    notebookId,
-    message: `${label} generation started${artifactId ? ` (id: ${artifactId})` : ""}. Check NotebookLM to view when ready.`,
-  };
+  return { type: label, status: "started", artifactId: artifactId || undefined, notebookId,
+    message: `${label} generation started${artifactId ? ` (id: ${artifactId})` : ""}. Open NotebookLM to view when ready.` };
 }
 
 export async function generateAudio(auth: AuthTokens, notebookId: string, instructions = "") {
-  // Audio params extra: [format, length, instructions_or_null]
-  return createArtifact(auth, notebookId, AT.AUDIO, "Audio Podcast",
-    [1, 2, instructions || null]); // format=DEEP_DIVE, length=DEFAULT
+  return artifact(auth, notebookId, AT.AUDIO, "Audio Podcast", [1, 2, instructions || null]);
 }
-
 export async function generateQuiz(auth: AuthTokens, notebookId: string) {
-  return createArtifact(auth, notebookId, AT.QUIZ, "Quiz", [2, 2]); // STANDARD qty, MEDIUM difficulty
+  return artifact(auth, notebookId, AT.QUIZ, "Quiz", [2, 2]);
 }
-
 export async function generateFlashcards(auth: AuthTokens, notebookId: string) {
-  return createArtifact(auth, notebookId, AT.QUIZ, "Flashcards", [2, 2]);
+  return artifact(auth, notebookId, AT.QUIZ, "Flashcards", [2, 2]);
 }
-
 export async function generateStudyGuide(auth: AuthTokens, notebookId: string) {
-  return createArtifact(auth, notebookId, AT.REPORT, "Study Guide", ["study_guide"]);
+  return artifact(auth, notebookId, AT.REPORT, "Study Guide", ["study_guide"]);
 }
-
 export async function generateBriefingDoc(auth: AuthTokens, notebookId: string) {
-  return createArtifact(auth, notebookId, AT.REPORT, "Briefing Doc", ["briefing_doc"]);
+  return artifact(auth, notebookId, AT.REPORT, "Briefing Doc", ["briefing_doc"]);
 }
-
 export async function generateMindMap(auth: AuthTokens, notebookId: string) {
   const data = await call(auth, M.GENERATE_MIND_MAP, [notebookId], notebookId) as unknown[];
   const id = Array.isArray(data) ? String(data[0] ?? "") : "";
-  return { type: "Mind Map", status: "started", artifactId: id || undefined, notebookId,
+  return { type: "Mind Map", status: "started", artifactId: id||undefined, notebookId,
     message: `Mind map generation started${id ? ` (id: ${id})` : ""}.` };
 }
-
 export async function generateSlideshow(auth: AuthTokens, notebookId: string) {
-  return createArtifact(auth, notebookId, AT.SLIDE_DECK, "Slide Deck", [1, 1]); // DETAILED_DECK, DEFAULT length
+  return artifact(auth, notebookId, AT.SLIDE_DECK, "Slide Deck", [1, 1]);
 }
 
-// ─── List artifacts ───────────────────────────────────────────────────────────
 export async function listArtifacts(auth: AuthTokens, notebookId: string): Promise<Artifact[]> {
   const data = await call(auth, M.LIST_ARTIFACTS, [notebookId], notebookId) as unknown[][];
   if (!Array.isArray(data)) return [];
   const rows = Array.isArray(data[0]) ? data[0] as unknown[][] : data as unknown[][];
   return rows.filter(Array.isArray).map((r, i) => ({
-    id:     String(r[0] ?? i),
-    type:   String(r[2] ?? "unknown"),
-    status: String(r[4] ?? "unknown"),
-    title:  String(r[1] ?? ""),
+    id: String(r[0] ?? i), type: String(r[2] ?? "unknown"),
+    status: String(r[4] ?? "unknown"), title: String(r[1] ?? ""),
   }));
 }
